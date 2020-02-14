@@ -1,13 +1,14 @@
 #### Fixed Rank Kriging Craigslist data for 2019 ------------------------------
 
+#dependencies
 library(dplyr)
-library(ggplot2)
 library(yaml)
 library(DBI)
 library(FRK)
 library(sp)
 library(sf)
-library(patchwork)
+library(purrr)
+library(stringr)
 
 #set wd to project base folder
 setwd("H:/natrent-krige")
@@ -15,7 +16,7 @@ setwd("H:/natrent-krige")
 #store credentials at base dir of natrent-city-sub as YAML
 cred <- read_yaml("./natrent0.yaml")
 
-#create a database connection
+#create a natrent database connection
 natrent <- dbConnect(
   drv = RPostgres::Postgres(),
   dbname = "natrent",
@@ -30,165 +31,176 @@ opts_FRK$set("parallel", 4L)
 
 #read cbsa shapefile
 cbsa <- read_sf("./input/ACS CBSA Polygon/US_cbsa_2017.shp") %>%
-  st_set_crs(102008) %>% #first properly identify the CRS
-  st_transform(4326) #then reproject
+  select(CSAFP, CBSAFP, NAME, geometry) %>%
+  rename(METRO = NAME)
 
-#### A. Query Neighborhood Estimates of CL Listing Activity --------------------
-
-#query for Washington DC listings as test case
-query <- "SELECT DISTINCT d.listing_date AS date, d.clean_beds AS beds, d.clean_sqft AS sqft, 
-                          d.clean_rent AS rent, c.state, c.county,
-                          ROUND(CAST(ST_X(ST_TRANSFORM(d.geometry, 4326)) as numeric), 3) as lng, 
-                          ROUND(CAST(ST_Y(ST_TRANSFORM(d.geometry, 4326)) as numeric), 3) as lat
-          FROM (
-                SELECT a.gisjoin AS trt_id, a.geometry, b.cbsafp AS met_id, b.statefp AS state, 
-                       b.countyfp AS county
-                FROM tract17 a
-                JOIN county17 b ON a.statefp = b.statefp AND a.countyfp = b.countyfp
-                WHERE b.cbsafp = ?cbsa_code
-          ) c
-          LEFT JOIN clean d ON ST_Contains(c.geometry, d.geometry) 
-          WHERE d.listing_date BETWEEN ?start AND ?end AND
-                d.match_type NOT IN ('No Address Found', 'Google Maps Lat/Long') AND
-                d.clean_beds = ?beds AND d.clean_rent IS NOT NULL
-          ORDER BY d.listing_date DESC"
+#read place shapefile
+places <- read_sf("./input/ACS Place Polygon/US_place_2017.shp") %>%
+  select(NAME, geometry) %>%
+  rename(PLACE = NAME)
 
 
-#set temporal cutoffs, bed size and cbsa (can be input args later)
-start_date <- "2019-01-01"
-cutoff_date <- "2019-12-31"
-bed_size <- 1
-cbsa_code <- "42660"
+#### Function to run Fixed Rank Kriging on listings for a given metro ---------
 
-#work these into the query
-query <- sqlInterpolate(natrent, query, 
-                           start = start_date,
-                           end = cutoff_date,
-                           beds = bed_size,
-                           cbsa_code = cbsa_code)
-
-#submit the query
-query <- dbGetQuery(natrent, query)
-
-#reduce to unique lat/lng via aggregation
-query <- query %>%
-  group_by(lat, lng) %>%
-  summarize(rent = median(rent),
-            sqft = median(sqft),
-            state = unique(state),
-            county = unique(county))
-
-#initialize as Spatial object
-coordinates(query) <- ~ lng + lat
-
-#set the projection to WGS84 lat/lng
-raster::projection(query) <- raster::crs(4326)
-
-
-#### B. Estimate Spatial Random Effects Model for listing data ----------------
-
-#e.g., points for 1B colored by rent
-#ggplot(sf::st_as_sf(query), 
-#       aes(color = rent)) +
-#  geom_sf() +
-#  scale_color_viridis_c()
-
-#run automated fixed rank kriging via FRK library
-#frk_formula <- log(rent) ~ 1 + beds
-#S <- FRK(f = frk_formula, 
-#         data = list(query))
-
-#predict values to obtain surface
-#Pred <- predict(S, obs_fs = FALSE) %>%
-#  st_as_sf()
-
-#plot surface
-#ggplot() +
-#  geom_tile(data = Pred, aes(x = lng, y = lat, fill = exp(mu)),
-#            color = "grey80", lwd = 0.01) +
-#  geom_point(data = as.data.frame(query@coords), 
-#                  aes(x = lng, y = lat),
-#             pch = 21, alpha = .5) +
-#  scale_fill_viridis_c() +
-#  coord_fixed() +
-#  theme_bw()
-
-#fine grained estimation of SRE
-set.seed(1)
-GridBAUs <- auto_BAUs(manifold = plane(), # 2D plane
-                      type = "hex", # hex grid
-                      data = query) # data around which to create BAUs
-
-GridBAUs$fs <- 1 # fine-scale variation at BAU level
-
-G <- auto_basis(manifold = plane(), # 2D plane
-                data = query, # queried data
-                nres = 3, # number of resolutions
-                type = "Gaussian", # type of basis function
-                regular = 1) # place regularly in domain
-
-#show_basis(G) + # illustrate basis functions
-#  coord_fixed() + # fix aspect ratio
-#  xlab("Easting (m)") + # x-label
-#  ylab("Northing (m)") # y-label
-
-f <- log(rent) ~ 1 # formula for SRE model
-
-S <- SRE(f = f, # formula
-         data = list(query), # list of datasets
-         BAUs = GridBAUs, # BAUs
-         basis = G, # basis functions
-         est_error = TRUE, # estimation measurement error
-         average_in_BAU = TRUE) # average data over BAUs
-
-S <- SRE.fit(SRE_model = S, # SRE model
-             n_EM = 10, # max. no. of EM iterations
-             tol = 0.01, # tolerance at which EM is assumed to have converged
-             print_lik=TRUE) # print log-likelihood at each iteration
-
-GridBAUsPred <- predict(S, obs_fs = FALSE) %>%
-  st_as_sf(coord = c("lng", "lat")) %>%
-  st_set_crs(4326)
-
-GridBAUsPred <- st_join(GridBAUsPred, cbsa, left = FALSE)
-
-
-#### C. Plot the Kriging Grid -------------------------------------------------
-
-theme_krige <- function(...){
-  theme_bw() +
-    theme(legend.position = "bottom",
-          legend.key.width = unit(1, "inch"),
-          legend.key.height = unit(.1, "inch"),
-          axis.text = element_blank()) +
-    xlab("") + ylab("") +
-    coord_fixed()
+kriger <- function(metro_code, bed_size = 1,
+                   start_date = "2019-01-01", end_date = "2019-12-31"){
+  
+  ## Define SQL query and submit to natrent
+  
+  #basic query
+  query <- "SELECT DISTINCT d.listing_date AS date, d.clean_beds AS beds, d.clean_sqft AS sqft, 
+                            d.clean_rent AS rent, c.state, c.county, c.met_name,
+                            ROUND(CAST(ST_X(ST_TRANSFORM(d.geometry, 4326)) as numeric), 3) as lng, 
+                            ROUND(CAST(ST_Y(ST_TRANSFORM(d.geometry, 4326)) as numeric), 3) as lat
+            FROM (
+                  SELECT a.geometry, a.cbsafp AS met_id, a.name AS met_name, b.statefp AS state, 
+                         b.countyfp AS county
+                  FROM cbsa17 a
+                  JOIN county17 b ON a.cbsafp = b.cbsafp
+                  WHERE a.cbsafp = ?cbsa_code AND b.cbsafp = ?cbsa_code
+            ) c
+            LEFT JOIN clean d ON ST_Contains(c.geometry, d.geometry) 
+            WHERE d.listing_date BETWEEN ?start AND ?end AND
+                  d.match_type NOT IN ('No Address Found', 'Google Maps Lat/Long') AND
+                  d.clean_beds = ?beds AND d.clean_rent IS NOT NULL
+            ORDER BY d.listing_date DESC"
+  
+  #work fn args into the query
+  query <- sqlInterpolate(natrent, query, 
+                          start = start_date,
+                          end = end_date,
+                          beds = bed_size,
+                          cbsa_code = metro_code)
+  
+  #submit the query
+  query <- dbGetQuery(natrent, query)
+  
+  #reduce to unique lat/lng via aggregation
+  query <- query %>%
+    group_by(lat, lng) %>%
+    summarize(rent = median(rent),
+              sqft = median(sqft),
+              state = max(state),
+              county = max(county),
+              metro = max(met_name))
+  
+  #assign a vector to capture the metro shorthand for output naming
+  metro_nickname <- unique(str_split_fixed(query$metro, pattern = "-", n = 2)[1])
+  
+  #initialize as Spatial object
+  coordinates(query) <- ~ lng + lat
+  
+  #set the projection to WGS84 lat/lng
+  proj4string(query) <- CRS("+init=epsg:4326")
+  
+  ## Estimate Spatial Random Effects Model for listing data
+  
+  #fine grained estimation of SRE
+  set.seed(1)
+  
+  #define Basic Areal Units
+  GridBAUs <- auto_BAUs(manifold = plane(),
+                        type = "hex", # hex grid
+                        data = query) # data around which to create BAUs
+  
+  GridBAUs$fs <- 1 # fine-scale variation at BAU level
+  
+  #define basis for kriging
+  G <- auto_basis(manifold = plane(), 
+                  data = query, # queried data
+                  nres = 3, # number of resolutions
+                  type = "Gaussian", # type of basis function
+                  regular = 1) # place regularly in domain
+  
+  #show_basis(G) + # illustrate basis functions
+  #  coord_fixed() + # fix aspect ratio
+  #  xlab("Easting (m)") + # x-label
+  #  ylab("Northing (m)") # y-label
+  
+  #formula for SRE model
+  f <- rent ~ 1 
+  
+  #run the SRE model routine
+  S <- SRE(f = f, # formula
+           data = list(query), # list of datasets
+           BAUs = GridBAUs, # BAUs
+           basis = G, # basis functions
+           est_error = TRUE, # estimation measurement error
+           average_in_BAU = TRUE) # average data over BAUs
+  
+  S <- SRE.fit(SRE_model = S, # SRE model
+               n_EM = 10, # max. no. of EM iterations
+               tol = 0.01, # tolerance at which EM is assumed to have converged
+               print_lik=TRUE) # print log-likelihood at each iteration
+  
+  #create predicted values for grid of hex cells
+  GridBAUsPred <- predict(S, obs_fs = FALSE) %>%
+    st_as_sf(coord = c("lng", "lat")) %>%
+    st_set_crs(4326) %>%
+    st_transform(st_crs(cbsa))
+  
+  #trim to CBSA bounds, rename some columns
+  GridBAUsPred <- st_join(GridBAUsPred, cbsa, left = FALSE) %>%
+    filter(CBSAFP == metro_code) %>%
+    rename(predicted = mu,
+           variance = var,
+           std_dev = sd) 
+  
+  if(!dir.exists(file.path(paste0("./output/shp/", metro_nickname)))){
+    dir.create(file.path(paste0("./output/shp/", metro_nickname)))
+  }
+  
+  #write shapefile of hexes to disk (no )
+  st_write(GridBAUsPred, 
+           file.path(paste0("./output/shp/", metro_nickname, "/", 
+                            bed_size, "B.shp")),
+           update = TRUE)
+  
+  #create map of kriged hexes
+  source("map.R", local = TRUE)
+  
+  #save model variogram/summary statistics (to do)
 }
 
-#plot predicted values and standard errors
-g1 <- ggplot() +
-  geom_hex(data = GridBAUsPred, 
-           aes(x = lng, y = lat, fill = exp(mu)),
-           stat = "identity", color = NA) +
-  scale_fill_distiller(palette = "Spectral",
-                       name = paste0("Predicted\n", bed_size, "B Rent"),
-                       labels = scales::dollar) +
-  geom_density_2d(data = as_tibble(query@coords), 
-                  aes(x = lng, y = lat),
-                  colour = "grey80") + 
-  theme_krige()
 
-#Similar to above but with s.e.
-g2 <- ggplot() + 
-  geom_hex(data= GridBAUsPred,
-            aes(x = lng, y = lat, fill = sqrt(var)),
-            stat = "identity") +
-  scale_fill_distiller(palette = "BrBG",
-                       name = "SE",
-                       guide = guide_legend(title="SE")) +
-  theme_krige()
+#test a few
+kriger("42660")
+kriger("42660", bed_size = 2)
+kriger("37980")
+kriger("37980", bed_size = 2)
 
-g1 + g2 +
-  ggsave(filename = paste0("./output/maps/", cbsa_code, "_kriged.pdf"),
-         width = 14, height = 9, dpi = 300)
+#### Kriging for top 100 metros across bedroom sizes --------------------------
+
+#query for n by cbsa
+metro_sql <- "SELECT a.cbsafp, a.name, count(b.geometry) as n
+              FROM cbsa17 a
+              INNER JOIN clean b ON ST_CONTAINS(a.geometry, b.geometry)
+              WHERE b.listing_date BETWEEN '2019-12-01' AND '2019-12-31' AND
+                    a.memi = '1'
+              GROUP BY a.cbsafp, a.name
+              ORDER BY n DESC"
+
+#fetch the query
+metros <- dbGetQuery(natrent, metro_sql)
+
+#filter the query result
+metros <- metros %>%
+  top_n(100, n)
+
+#specify bedroom sizes for the kriging
+bed_sizes <- 0:3
+
+#make a list out of these values to pass to purr::cross_df()
+args <- list(cbsafp = metros$cbsafp, bed_size = bed_sizes) %>%
+  cross_df() %>%
+  arrange(cbsafp)
+
+#join the counts
+args <- left_join(args, metros)
+
+#arrange from most to least
+args <- arrange(args, desc(n))
+
+#map the columns to kriger for running the function on each combination
+map2(args$cbsafp, args$bed_size, kriger)
 
