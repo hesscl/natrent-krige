@@ -61,7 +61,7 @@ kriger <- function(metro_code, bed_size = 1,
             ) c
             LEFT JOIN clean d ON ST_Contains(c.geometry, d.geometry) 
             WHERE d.listing_date BETWEEN ?start AND ?end AND
-                  d.match_type NOT IN ('No Address Found', 'Google Maps Lat/Long') AND
+                  d.match_type NOT IN ('No Address Found') AND
                   d.clean_beds = ?beds AND d.clean_rent IS NOT NULL
             ORDER BY d.listing_date DESC"
   
